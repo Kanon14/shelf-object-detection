@@ -118,7 +118,7 @@ if planogram_data:
 # Detection Mode
 # ----------------------------------------------------------------------------
 st.divider()
-mode = st.radio("Mode", ["Image", "Video"], horizontal=True)
+mode = st.radio("Mode", ["Image", "Video", "Livecam"], horizontal=True)
 
 # ----------------------------------------------------------------------------
 # Image Mode
@@ -181,5 +181,112 @@ if mode == "Image":
                 mime="text/csv"
             )
             
+# ----------------------------------------------------------------------------
+# Video Mode
+# ----------------------------------------------------------------------------    
+else:
+    up_vid = st.file_uploader("Upload shelf video (mp4/mov/avi)", type=["mp4", "mov", "avi"])
+    
+    if up_vid is not None and model is not None:
+        vid_path = f"saved_video/{up_vid.name}"
+        with open(vid_path, "wb") as f:
+            f.write(up_vid.read())
             
+        cap = cv2.VideoCapture(vid_path)
+        if not cap.isOpened():
+            st.error("Failed to open video.")
+        else:
+            stframe = st.empty()
+            info = st.empty()
             
+            from collections import deque
+            count_window = deque(maxlen=7)
+            
+            # Aggregate worst status per facing across frames
+            status_order = {"OK": 0, "LOW": 1, "OOS": 2}
+            per_facing_scores: Dict[str, List[int]] = {f.id: [] for f in facings} if facings else {}
+
+
+            processed = 0
+            frame_idx = 0
+            t0 = time.time()
+                        
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                frame_idx += 1
+                if frame_idx % frame_skip != 0:
+                    continue
+                
+                H, W = frame.shape[:2]
+                view = frame
+                x_off = y_off = 0
+                if use_roi:
+                    rx1 = clamp(int(roi_x1), 0, W)
+                    ry1 = clamp(int(roi_y1), 0, H)
+                    rx2 = clamp(int(roi_x2) if roi_x2 > 0 else W, 0, W)
+                    ry2 = clamp(int(roi_y2) if roi_y2 > 0 else H, 0, H)
+                    if rx2 > rx1 and ry2 > ry1:
+                        view = frame[ry1:ry2, rx1:rx2]
+                        x_off, y_off = rx1, ry1
+                        
+                    boxes = run_yolo_on_image(model, view, conf=conf, iou=iou, imgsz=imgsz)
+                    if use_roi and boxes.size > 0:
+                        boxes[:, [0, 2]] += x_off
+                        boxes[:, [1, 3]] += y_off
+                        
+                    total = int(boxes.shape[0])
+                    count_window.append(total)
+                    smoothed = int(np.median(count_window))
+                    
+                    # Per-frame facing status
+                    status_map: Dict[str, str] = {}
+                    if facings:
+                        for f in facings:
+                            res = facing_status(f, boxes, occ_empty=occ_empty, occ_low=occ_low, iou_threshold=iou_face)
+                            status_map[f.id] = res.status
+                            per_facing_scores[f.id].append(status_order[res.status])
+                            
+                    vis = draw_boxes(frame, boxes)
+                    if facings:
+                        vis = draw_facings(vis, facings, status_map)
+                        
+                    info.markdown(f"**Frame:** {frame_idx} | **Detected:** {total} | **Smoothed:** {smoothed}")
+                    stframe.image(vis[..., ::-1], use_container_width=True)
+
+
+                    processed += 1
+                    if max_frames > 0 and processed >= max_frames:
+                        break
+                
+                cap.release()
+                st.success(f"Done. Processed {processed} frames in {time.time() - t0:.2f}s")
+                
+                if facings and per_facing_scores:
+                    inv = {0: "OK", 1: "LOW", 2: "OOS"}
+                    rows = []
+                    for fid, scores in per_facing_scores.items():
+                        if scores:
+                            worst = max(scores)
+                            rows.append({"Facing": fid, "Status_over_Video": inv[worst]})
+                        else:
+                            rows.append({"Facing": fid, "Status_over_Video": "UNKNOWN"})
+                            df = pd.DataFrame(rows)
+                            st.subheader("Video OOS Summary")
+                            st.dataframe(df, use_container_width=True)
+                            st.download_button("Download Video OOS Summary CSV",
+                                                data=df.to_csv(index=False).encode("utf-8"),
+                                                file_name="oos_video_summary.csv",
+                                                mime="text/csv",)
+                            
+                            
+
+        
+# ----------------------------------------------------------------------------
+# Tips
+# ----------------------------------------------------------------------------
+st.info(
+"Tips: Start with confidence=0.25 and IoU=0.6. Increase image size (800-960) if small items are missed. "
+"For dense shelves, high-resolution inputs and ROI cropping improve both speed and accuracy."
+)
