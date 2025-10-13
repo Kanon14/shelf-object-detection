@@ -184,7 +184,7 @@ if mode == "Image":
 # ----------------------------------------------------------------------------
 # Video Mode
 # ----------------------------------------------------------------------------    
-else:
+elif mode == "Video":
     up_vid = st.file_uploader("Upload shelf video (mp4/mov/avi)", type=["mp4", "mov", "avi"])
     
     if up_vid is not None and model is not None:
@@ -279,10 +279,107 @@ else:
                                                 data=df.to_csv(index=False).encode("utf-8"),
                                                 file_name="oos_video_summary.csv",
                                                 mime="text/csv",)
-                            
-                            
 
+# ----------------------------------------------------------------------------
+# Livecam Mode
+# ----------------------------------------------------------------------------                          
+elif mode == "Livecam":
+    st.subheader("Live Camera Inference")
+    src_type = st.radio("Source", ["Webcam index", "RTSP/HTTP URL"], horizontal=True) 
+    
+    cam_index = None
+    cam_url = None
+    if src_type == "Webcam index":
+        cam_index = st.number_input("Camera index", min_value=0, value=0, step=1)
+    else:
+        cam_url = st.text_input("Camera URL", value="rtsp://user:pass@ip554/stream") 
         
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        res = st.selectbox("Resolution", ["640x480", "1280x720", "1920x1080"], index=1)
+    with col2:
+        live_frame_skip = st.slider("Process every Nth frame", 1, 10, 2)
+    with col3:
+        live_max_frames = st.number_input("Max frames (0 = unlimited)", value=0, min_value=0) 
+    
+    mirror = st.checkbox("Mirror (flip horizontally)", value=True)
+    
+    start = st.button("Start Live Inference")
+    
+    if start and model is not None:
+        # Open camera
+        src = cam_index if cam_index is not None else cam_url
+        cap = cv2.VideoCapture(src)
+        if not cap.isOpened():
+            st.error("Failed to open camera source.")
+        else:
+            # Set resolution if supported
+            w, h = map(int, res.split("x"))
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
+            
+            stframe = st.empty()
+            info = st.empty()
+            from collections import deque
+            count_window = deque(maxlen=7)
+        
+            processed = 0
+            frame_idx = 0
+            t0 = time.time()
+            
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                frame_idx += 1
+                if frame_idx % live_frame_skip != 0:
+                    continue
+                
+                if mirror:
+                    frame = cv2.flip(frame, 1)
+                    
+                H, W = frame.shape[:2]
+                view = frame
+                x_off, y_off = 0
+                if use_roi:
+                    rx1 = clamp(int(roi_x1), 0, W)
+                    ry1 = clamp(int(roi_y1), 0, H)
+                    rx2 = clamp(int(roi_x2) if roi_x2 > 0 else W, 0, W)
+                    ry2 = clamp(int(roi_y2) if roi_y2 > 0 else H, 0, H)
+                    if rx2 > rx1 and ry2 > ry1:
+                        view = frame[ry1:ry2, rx1:rx2]
+                        x_off, y_off = rx1, ry1
+                        
+                boxes = run_yolo_on_image(model, view, conf=conf, iou=iou, imgsz=imgsz)
+                if use_roi and boxes.size > 0:
+                    boxes[:, [0, 2]] += x_off
+                    boxes[:, [1, 3]] += y_off
+                    
+                total = int(boxes.shape[0])
+                count_window.append(total)
+                smoothed = int(np.median(count_window))
+                
+                # Per-frame facing status (optional)
+                status_map: Dict[str, str] = {}
+                if facings:
+                    for f in facings:
+                        resR = facing_status(f, boxes, occ_empty=occ_empty, occ_low=occ_low, iou_threshold=iou_face)
+                        status_map[f.id] = resR.status
+                        
+                vis = draw_boxes(frame, boxes)
+                if facings:
+                    vis = draw_facings(vis, facings, status_map)
+                    
+                info.markdown(f"**Frame:** {frame_idx} | **Detected:** {total} | **Smoothed:** {smoothed}")
+                stframe.image(vis[..., ::-1], use_container_width=True)
+
+                processed += 1
+                if live_max_frames > 0 and processed >= live_max_frames:
+                    break  
+                
+            cap.release()
+            st.success(f"Stopped. Processed {processed} frames in {time.time()-t0:.2f}s")       
+                
 # ----------------------------------------------------------------------------
 # Tips
 # ----------------------------------------------------------------------------
